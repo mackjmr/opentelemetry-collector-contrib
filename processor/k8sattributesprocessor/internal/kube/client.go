@@ -48,6 +48,7 @@ type WatchClient struct {
 	daemonsetInformer      cache.SharedInformer
 	jobInformer            cache.SharedInformer
 	replicasetInformer     cache.SharedInformer
+	kubeletPodSource       *kubeletPodSource
 	cronJobRegex           *regexp.Regexp
 	deleteQueue            []deleteRequest
 	stopCh                 chan struct{}
@@ -124,6 +125,14 @@ type InformersFactoryList struct {
 }
 
 // New initializes a new k8s Client.
+//
+// If kubeletPodCfg is non-nil, pods are detected by polling the local
+// kubelet /pods endpoint instead of watching the Kubernetes API server's
+// pod resource. Namespace, node, and workload (deployment, statefulset,
+// daemonset, job) metadata is still resolved via API server informers in
+// this mode — only the pod source is swapped. This removes the heavy
+// cluster-wide pod watch from the API server while preserving full
+// enrichment.
 func New(
 	set component.TelemetrySettings,
 	apiCfg k8sconfig.APIConfig,
@@ -137,6 +146,7 @@ func New(
 	waitForMetadataTimeout time.Duration,
 	watchSyncPeriod time.Duration,
 	podDeleteGracePeriod time.Duration,
+	kubeletPodCfg *KubeletPodSourceConfig,
 ) (Client, error) {
 	telemetryBuilder, err := metadata.NewTelemetryBuilder(set)
 	if err != nil {
@@ -166,6 +176,14 @@ func New(
 	c.StatefulSets = map[string]*StatefulSet{}
 	c.DaemonSets = map[string]*DaemonSet{}
 	c.Jobs = map[string]*Job{}
+
+	if kubeletPodCfg != nil {
+		src, err := newKubeletPodSource(*kubeletPodCfg, set.Logger)
+		if err != nil {
+			return nil, err
+		}
+		c.kubeletPodSource = src
+	}
 
 	if newClientSet == nil {
 		newClientSet = k8sconfig.MakeClientBundle
@@ -211,19 +229,24 @@ func New(
 		}
 	}
 
-	c.informer = informersFactory.newInformer(c.kc, c.Filters.Namespace, labelSelector, fieldSelector)
-	err = c.informer.SetTransform(
-		func(object any) (any, error) {
-			originalPod, success := object.(*api_v1.Pod)
-			if !success { // means this is a cache.DeletedFinalStateUnknown, in which case we do nothing
-				return object, nil
-			}
+	// In kubelet-source mode the pod informer is replaced by the
+	// kubeletPodSource polling loop; the API-server pod watch is what we're
+	// trying to avoid here, so skip creating it.
+	if c.kubeletPodSource == nil {
+		c.informer = informersFactory.newInformer(c.kc, c.Filters.Namespace, labelSelector, fieldSelector)
+		err = c.informer.SetTransform(
+			func(object any) (any, error) {
+				originalPod, success := object.(*api_v1.Pod)
+				if !success { // means this is a cache.DeletedFinalStateUnknown, in which case we do nothing
+					return object, nil
+				}
 
-			return removeUnnecessaryPodData(originalPod, c.Rules), nil
-		},
-	)
-	if err != nil {
-		return nil, err
+				return removeUnnecessaryPodData(originalPod, c.Rules), nil
+			},
+		)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	c.namespaceInformer = informersFactory.newNamespaceInformer(c.mc)
@@ -367,6 +390,37 @@ func (c *WatchClient) Start() error {
 		}
 		synced = append(synced, reg.HasSynced)
 		go c.jobInformer.Run(c.stopCh)
+	}
+
+	if c.kubeletPodSource != nil {
+		// Wait for the non-pod informers (replicaset, namespace, etc.) to
+		// sync before starting kubelet polling, so owner-reference lookups
+		// resolve. Mirrors runInformerWithDependencies for the API-server
+		// pod informer path below.
+		go func() {
+			if len(synced) > 0 {
+				timeoutCh := make(chan struct{})
+				t := time.AfterFunc(5*time.Second, func() { close(timeoutCh) })
+				defer t.Stop()
+				cache.WaitForCacheSync(timeoutCh, synced...)
+			}
+			c.kubeletPodSource.run(c.stopCh,
+				func(pod *api_v1.Pod) { c.handlePodAdd(pod) },
+				func(pod *api_v1.Pod) { c.handlePodDelete(pod) },
+			)
+		}()
+		// We don't currently expose a "first poll done" signal, so when
+		// waitForMetadata is set in kubelet mode we only wait for the
+		// non-pod informers.
+		if c.waitForMetadata && len(synced) > 0 {
+			timeoutCh := make(chan struct{})
+			t := time.AfterFunc(c.waitForMetadataTimeout, func() { close(timeoutCh) })
+			defer t.Stop()
+			if !cache.WaitForCacheSync(timeoutCh, synced...) {
+				return errors.New("failed to wait for caches to sync")
+			}
+		}
+		return nil
 	}
 
 	reg, err = c.informer.AddEventHandler(cache.ResourceEventHandlerFuncs{

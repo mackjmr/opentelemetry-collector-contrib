@@ -12,6 +12,7 @@ import (
 	"k8s.io/apimachinery/pkg/selection"
 
 	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/k8sconfig"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/kubelet"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/processor/k8sattributesprocessor/internal/kube"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/processor/k8sattributesprocessor/internal/metadata"
 )
@@ -439,6 +440,31 @@ func withWatchSyncPeriod(duration time.Duration) option {
 func withPodDeleteGracePeriod(duration time.Duration) option {
 	return func(p *kubernetesprocessor) error {
 		p.podDeleteGracePeriod = duration
+		return nil
+	}
+}
+
+// withKubeletSource configures the processor to detect pods by polling the
+// local kubelet /pods endpoint instead of watching the Kubernetes API server.
+func withKubeletSource(cfg KubeletConfig) option {
+	return func(p *kubernetesprocessor) error {
+		pollInterval := cfg.PollInterval
+		if pollInterval == 0 {
+			pollInterval = 10 * time.Second
+		}
+		authType := cfg.AuthType
+		if authType == "" {
+			authType = k8sconfig.AuthTypeServiceAccount
+		}
+		p.kubeletPodCfg = &kube.KubeletPodSourceConfig{
+			Endpoint: cfg.Endpoint,
+			Client: kubelet.ClientConfig{
+				APIConfig:          k8sconfig.APIConfig{AuthType: authType},
+				Config:             cfg.TLS,
+				InsecureSkipVerify: cfg.InsecureSkipVerify,
+			},
+			PollInterval: pollInterval,
+		}
 		return nil
 	}
 }

@@ -285,6 +285,10 @@ func createProcessorOpts(cfg component.Config) []option {
 		withWatchSyncPeriod(oCfg.WatchSyncPeriod),
 		withPodDeleteGracePeriod(oCfg.PodDeleteGracePeriod))
 
+	if oCfg.Source == SourceKubelet {
+		opts = append(opts, withKubeletSource(oCfg.Kubelet))
+	}
+
 	if oCfg.WaitForMetadata {
 		opts = append(opts, withWaitForMetadata(true))
 	}

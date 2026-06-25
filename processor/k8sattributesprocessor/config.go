@@ -10,11 +10,49 @@ import (
 	"regexp"
 	"time"
 
+	"go.opentelemetry.io/collector/config/configtls"
 	conventions "go.opentelemetry.io/otel/semconv/v1.41.0"
 
 	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/k8sconfig"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/processor/k8sattributesprocessor/internal/kube"
 )
+
+// Source values for Config.Source.
+const (
+	// SourceAPIServer (default) detects pods by watching the Kubernetes API
+	// server via informers.
+	SourceAPIServer = "api_server"
+	// SourceKubelet detects pods by polling the local kubelet /pods endpoint.
+	// In this mode the processor only sees pods running on the same node and
+	// does not enrich namespace, node, or workload (deployment, statefulset,
+	// daemonset, job, cronjob) attributes.
+	SourceKubelet = "kubelet"
+)
+
+// KubeletConfig configures the kubelet pod source used when Source is
+// set to "kubelet".
+type KubeletConfig struct {
+	// Endpoint is the kubelet endpoint (e.g. "https://${HOST_IP}:10250").
+	// If empty, the node hostname is used.
+	Endpoint string `mapstructure:"endpoint"`
+
+	// AuthType controls how the kubelet endpoint is authenticated against.
+	// Allowed values mirror k8sconfig.AuthType: "none", "tls",
+	// "serviceAccount", "kubeConfig". Defaults to "serviceAccount" when
+	// kubelet detection is enabled and no value is provided.
+	AuthType k8sconfig.AuthType `mapstructure:"auth_type"`
+
+	// TLS provides TLS configuration for the kubelet connection.
+	TLS configtls.Config `mapstructure:"tls"`
+
+	// InsecureSkipVerify disables verification of the kubelet's TLS
+	// certificate. Useful for self-signed kubelet certs.
+	InsecureSkipVerify bool `mapstructure:"insecure_skip_verify"`
+
+	// PollInterval is how often to poll the kubelet /pods endpoint.
+	// Defaults to 10 seconds when unset.
+	PollInterval time.Duration `mapstructure:"poll_interval"`
+}
 
 // Config defines configuration for k8s attributes processor.
 type Config struct {
@@ -55,11 +93,35 @@ type Config struct {
 
 	// PodDeleteGracePeriod is the duration to wait before deleting a pod from the cache after receiving a delete event.
 	PodDeleteGracePeriod time.Duration `mapstructure:"pod_delete_grace_period"`
+
+	// Source controls how pod metadata is discovered. Allowed values are
+	// "api_server" (default) and "kubelet". When set to "kubelet", the
+	// processor polls the local kubelet /pods endpoint instead of watching
+	// pods via the Kubernetes API server. Namespace, node, and workload
+	// (deployment, statefulset, daemonset, job) metadata is still resolved
+	// via the API server, only the pod source is swapped. This removes the
+	// heavy cluster-wide pod watch from the API server while keeping full
+	// enrichment.
+	Source string `mapstructure:"source"`
+
+	// Kubelet configures the connection to the kubelet when Source is
+	// "kubelet". It is ignored otherwise.
+	Kubelet KubeletConfig `mapstructure:"kubelet"`
 }
 
 func (cfg *Config) Validate() error {
+	switch cfg.Source {
+	case "", SourceAPIServer, SourceKubelet:
+	default:
+		return fmt.Errorf("%q is not a valid source. Must be one of: %s, %s", cfg.Source, SourceAPIServer, SourceKubelet)
+	}
+
 	if err := cfg.APIConfig.Validate(); err != nil {
 		return err
+	}
+
+	if cfg.Kubelet.PollInterval < 0 {
+		return errors.New("kubelet.poll_interval must be greater than or equal to 0")
 	}
 
 	if cfg.WatchSyncPeriod < 0 {
