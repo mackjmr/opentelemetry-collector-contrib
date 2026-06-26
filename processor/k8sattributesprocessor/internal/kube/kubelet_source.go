@@ -92,6 +92,7 @@ func (s *kubeletPodSource) poll(onAdd, onDelete func(*api_v1.Pod)) {
 		s.logger.Warn("failed to unmarshal kubelet pods response", zap.Error(err))
 		return
 	}
+	s.logger.Debug("kubelet pod poll completed", zap.Int("pod_count", len(list.Items)))
 
 	current := make(map[types.UID]*api_v1.Pod, len(list.Items))
 	for i := range list.Items {

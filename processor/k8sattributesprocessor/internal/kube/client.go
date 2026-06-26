@@ -183,6 +183,9 @@ func New(
 			return nil, err
 		}
 		c.kubeletPodSource = src
+		set.Logger.Info("using kubelet pod source", zap.String("endpoint", kubeletPodCfg.Endpoint))
+	} else {
+		set.Logger.Info("using api_server pod source")
 	}
 
 	if newClientSet == nil {
